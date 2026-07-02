@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vajraa Key Management Server (KMS)</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&family=Space+Grotesk:wght@400;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0b0f19;
+            --surface-color: rgba(17, 24, 39, 0.7);
+            --primary-glow: linear-gradient(135deg, #7c3aed 0%, #3b82f6 100%);
+            --accent-glow: linear-gradient(135deg, #ec4899 0%, #8b5cf6 100%);
+            --text-main: #f3f4f6;
+            --text-secondary: #9ca3af;
+            --success-color: #10b981;
+            --error-color: #ef4444;
+            --glass-border: rgba(255, 255, 255, 0.08);
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            min-height: 100vh;
+            overflow-x: hidden;
+            background-image: 
+                radial-gradient(at 10% 20%, rgba(124, 58, 237, 0.15) 0px, transparent 50%),
+                radial-gradient(at 90% 80%, rgba(59, 130, 246, 0.15) 0px, transparent 50%);
+            background-attachment: fixed;
+        }
+
+        header {
+            background: rgba(15, 23, 42, 0.6);
+            backdrop-filter: blur(12px);
+            border-bottom: 1px solid var(--glass-border);
+            padding: 20px 40px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+        }
+
+        h1 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 24px;
+            font-weight: 800;
+            background: var(--primary-glow);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 40px auto;
+            padding: 0 20px;
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+            margin-bottom: 40px;
+        }
+
+        @media (max-width: 900px) {
+            .grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .card {
+            background: var(--surface-color);
+            backdrop-filter: blur(16px);
+            border: 1px solid var(--glass-border);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            transition: transform 0.3s ease, box-shadow 0.3s ease;
+        }
+
+        .card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 12px 35px rgba(124, 58, 237, 0.12);
+        }
+
+        h2 {
+            font-family: 'Space Grotesk', sans-serif;
+            font-size: 20px;
+            margin-bottom: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+        }
+
+        label {
+            display: block;
+            font-size: 14px;
+            color: var(--text-secondary);
+            margin-bottom: 8px;
+            font-weight: 600;
+        }
+
+        input, select {
+            width: 100%;
+            padding: 12px 16px;
+            background: rgba(0, 0, 0, 0.4);
+            border: 1px solid var(--glass-border);
+            border-radius: 10px;
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            font-size: 15px;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input:focus, select:focus {
+            outline: none;
+            border-color: #7c3aed;
+            box-shadow: 0 0 10px rgba(124, 58, 237, 0.25);
+        }
+
+        button {
+            width: 100%;
+            padding: 14px;
+            background: var(--primary-glow);
+            border: none;
+            border-radius: 10px;
+            color: white;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 700;
+            font-size: 16px;
+            cursor: pointer;
+            transition: opacity 0.2s, transform 0.2s;
+        }
+
+        button:hover {
+            opacity: 0.95;
+            transform: scale(1.01);
+        }
+
+        button:active {
+            transform: scale(0.99);
+        }
+
+        .table-card {
+            grid-column: 1 / -1;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 15px;
+            text-align: left;
+        }
+
+        th, td {
+            padding: 14px 20px;
+            border-bottom: 1px solid var(--glass-border);
+        }
+
+        th {
+            font-family: 'Space Grotesk', sans-serif;
+            color: var(--text-secondary);
+            font-weight: 600;
+            font-size: 14px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        td {
+            font-size: 15px;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .status-badge {
+            display: inline-block;
+            padding: 4px 10px;
+            border-radius: 20px;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+        }
+
+        .status-active {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success-color);
+        }
+
+        .status-revoked {
+            background: rgba(239, 68, 68, 0.15);
+            color: var(--error-color);
+        }
+
+        .btn-danger {
+            background: rgba(239, 68, 68, 0.2);
+            color: var(--error-color);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            padding: 6px 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background 0.2s;
+            width: auto;
+        }
+
+        .btn-danger:hover {
+            background: rgba(239, 68, 68, 0.4);
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <h1>VAJRAA KMS</h1>
+        <span style="font-size: 14px; color: var(--text-secondary);">Secure License Server</span>
+    </header>
+
+    <div class="container">
+        <div class="grid">
+            <!-- Register Customer -->
+            <div class="card">
+                <h2>New Customer</h2>
+                <form action="/admin/customer" method="POST" id="form-customer">
+                    <div class="form-group">
+                        <label for="customer-id">Customer ID (Unique Slug)</label>
+                        <input type="text" id="customer-id" name="id" placeholder="e.g. AcmeCorp" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="customer-name">Customer Name</label>
+                        <input type="text" id="customer-name" name="name" placeholder="e.g. Acme Corporation Inc." required>
+                    </div>
+                    <div class="form-group">
+                        <label for="max-licenses">License Quota</label>
+                        <input type="number" id="max-licenses" name="max_licenses" value="5" min="1">
+                    </div>
+                    <button type="submit" id="btn-submit-customer">Register Customer</button>
+                </form>
+            </div>
+
+            <!-- Issue License -->
+            <div class="card">
+                <h2>Issue Model License</h2>
+                <form action="/admin/license" method="POST" id="form-license">
+                    <div class="form-group">
+                        <label for="license-customer">Assign to Customer</label>
+                        <select id="license-customer" name="customer_id" required>
+                            <option value="" disabled selected>Select Customer...</option>
+                            {% for cust in customers %}
+                                <option value="{{ cust.id }}">{{ cust.name }} ({{ cust.id }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="license-name">Model / Application Name</label>
+                        <input type="text" id="license-name" name="name" placeholder="e.g. Llama-3-8B-Security" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="trial-days">Trial/Validity Period (Days)</label>
+                        <input type="number" id="trial-days" name="trial_days" value="30" min="1">
+                    </div>
+                    <div class="form-group">
+                        <label for="max-devices">Max Devices limit</label>
+                        <input type="number" id="max-devices" name="max_devices" value="3" min="1">
+                    </div>
+                    <button type="submit" id="btn-submit-license">Issue License</button>
+                </form>
+            </div>
+
+            <!-- Customers Table -->
+            <div class="card table-card">
+                <h2>Registered Customers</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Name</th>
+                            <th>Status</th>
+                            <th>Max Licenses</th>
+                            <th>Registered At</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for cust in customers %}
+                        <tr>
+                            <td><strong>{{ cust.id }}</strong></td>
+                            <td>{{ cust.name }}</td>
+                            <td><span class="status-badge status-active">{{ cust.status }}</span></td>
+                            <td>{{ cust.max_licenses }}</td>
+                            <td>{{ cust.created_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Licenses Table -->
+            <div class="card table-card">
+                <h2>Active Licenses</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>License ID</th>
+                            <th>Customer</th>
+                            <th>Application</th>
+                            <th>Expires At</th>
+                            <th>Device Limit</th>
+                            <th>Action</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for lic in licenses %}
+                        <tr>
+                            <td><code>{{ lic.id }}</code></td>
+                            <td>{{ lic.customer_id }}</td>
+                            <td>{{ lic.name }}</td>
+                            <td>{{ lic.expires_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                            <td>{{ lic.max_devices }}</td>
+                            <td>
+                                {% if not lic.is_revoked %}
+                                <form action="/admin/license/revokeBlock/{{ lic.id }}" method="POST" style="display:inline;" id="revoke-{{ lic.id }}">
+                                    <!-- Replace block in path via FastAPI override if needed -->
+                                </form>
+                                <form action="/admin/license/revoke/{{ lic.id }}" method="POST" style="display:inline;">
+                                    <button type="submit" class="btn-danger">Revoke</button>
+                                </form>
+                                {% else %}
+                                <span class="status-badge status-revoked">Revoked</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- Activations Table -->
+            <div class="card table-card">
+                <h2>Device Activations</h2>
+                <table>
+                    <thead>
+                        <tr>
+                            <th>Activation ID</th>
+                            <th>License ID</th>
+                            <th>Device Fingerprint Hash</th>
+                            <th>Activated At</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for act in activations %}
+                        <tr>
+                            <td><code>{{ act.id }}</code></td>
+                            <td><code>{{ act.license_id }}</code></td>
+                            <td><code style="font-size: 12px; color: var(--text-secondary);">{{ act.hardware_hash[:24] }}...</code></td>
+                            <td>{{ act.activated_at.strftime('%Y-%m-%d %H:%M') }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

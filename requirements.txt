@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+sqlmodel
+cryptography
+jinja2
+python-multipart
