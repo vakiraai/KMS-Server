@@ -24,13 +24,53 @@ from .database import create_db_and_tables, get_session
 from .models import Customer, License, Activation, AuditLog
 from .crypto_utils import generate_key, encrypt_data, decrypt_data, derive_kek
 
+# =====================================================================
+# SECRETS MANAGEMENT & FAIL-OPEN PREVENTION
+# =====================================================================
+
+IS_TESTING = os.getenv("TESTING", "false").lower() == "true"
+
 raw_secret = os.getenv("SERVER_SECRET", "vajraa_kms_master_secret_key_2026")
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "vajraa-secure-admin-pass-2026")
+
+if not IS_TESTING:
+    # Fail-safe startup: refuse to boot on defaults or empty configurations
+    if raw_secret == "vajraa_kms_master_secret_key_2026" or not os.getenv("SERVER_SECRET"):
+        raise RuntimeError("CRITICAL SECURITY ERROR: SERVER_SECRET is unset or set to the default placeholder! Aborting startup.")
+    if ADMIN_USER == "admin" or not os.getenv("ADMIN_USER"):
+        raise RuntimeError("CRITICAL SECURITY ERROR: ADMIN_USER is unset or set to 'admin'! Aborting startup.")
+    if ADMIN_PASS == "vajraa-secure-admin-pass-2026" or not os.getenv("ADMIN_PASS"):
+        raise RuntimeError("CRITICAL SECURITY ERROR: ADMIN_PASS is unset or set to the default placeholder! Aborting startup.")
+
 SERVER_SECRET = hashlib.sha256(raw_secret.encode("utf-8")).digest()
 
-# Asymmetric Ed25519 keys derived deterministically from SERVER_SECRET
-private_key = ed25519.Ed25519PrivateKey.from_private_bytes(SERVER_SECRET)
-public_key = private_key.public_key()
-PUBLIC_KEY_HEX = public_key.public_bytes_raw().hex()
+# =====================================================================
+# PLUGGABLE KMS PROVIDER ABSTRACTION
+# =====================================================================
+
+class KMSProvider:
+    """Abstract Base Class for pluggable KMS/HSM signing operations."""
+    def sign(self, message: bytes) -> bytes:
+        raise NotImplementedError()
+    def get_public_key_hex(self) -> str:
+        raise NotImplementedError()
+
+class LocalEncryptedKMS(KMSProvider):
+    """Local secure KMS provider derived deterministically from the Server Secret."""
+    def __init__(self, secret_bytes: bytes):
+        self.private_key = ed25519.Ed25519PrivateKey.from_private_bytes(secret_bytes)
+        self.public_key = self.private_key.public_key()
+        
+    def sign(self, message: bytes) -> bytes:
+        return self.private_key.sign(message)
+        
+    def get_public_key_hex(self) -> str:
+        return self.public_key.public_bytes_raw().hex()
+
+# Active KMS Key Provider instance. Easy to subclass and swap for AWS/GCP KMS.
+kms_provider = LocalEncryptedKMS(SERVER_SECRET)
+PUBLIC_KEY_HEX = kms_provider.get_public_key_hex()
 
 app = FastAPI(title="Vajraa Licensing Server")
 
@@ -44,9 +84,6 @@ app.add_middleware(
 )
 
 # Admin credentials
-ADMIN_USER = os.getenv("ADMIN_USER", "admin")
-ADMIN_PASS = os.getenv("ADMIN_PASS", "vajraa-secure-admin-pass-2026")
-
 security = HTTPBasic()
 
 # In-memory sliding-window rate limiter
@@ -347,9 +384,9 @@ def api_activate_offline(
         
     expires_at_str = lic.expires_at.isoformat()
     
-    # 1. Asymmetric Ed25519 signature
+    # 1. Asymmetric sign via pluggable KMS
     canonical_payload = f"{license_id}:{fingerprint_hash}:{expires_at_str}"
-    signature = private_key.sign(canonical_payload.encode("utf-8"))
+    signature = kms_provider.sign(canonical_payload.encode("utf-8"))
     signature_hex = signature.hex()
     
     # 2. Derive KEK using the signature and fingerprint hash via HKDF
@@ -440,9 +477,9 @@ def api_activate(payload: dict, request: Request, session: Session = Depends(get
         
     expires_at_str = lic.expires_at.isoformat()
     
-    # 1. Asymmetric Ed25519 signature
+    # 1. Asymmetric sign via pluggable KMS
     canonical_payload = f"{license_id}:{fingerprint_hash}:{expires_at_str}"
-    signature = private_key.sign(canonical_payload.encode("utf-8"))
+    signature = kms_provider.sign(canonical_payload.encode("utf-8"))
     signature_hex = signature.hex()
     
     # 2. Derive KEK
@@ -485,7 +522,7 @@ def api_activate(payload: dict, request: Request, session: Session = Depends(get
 def api_verify(payload: dict, request: Request, session: Session = Depends(get_session)):
     """API endpoint for periodic online client verification with rate limiting."""
     client_ip = request.client.host if request.client else "127.0.0.1"
-    check_rate_limit(client_ip, limit=20, period=60) # Higher limit for periodic verifications
+    check_rate_limit(client_ip, limit=20, period=60)
     
     license_id = payload.get("license_id")
     fingerprint_hash = payload.get("fingerprint_hash")
@@ -508,4 +545,35 @@ def api_verify(payload: dict, request: Request, session: Session = Depends(get_s
     return {
         "status": "ACTIVE",
         "expires_at": lic.expires_at.isoformat()
+    }
+
+@app.get("/api/revocations")
+def get_revocations(request: Request, session: Session = Depends(get_session)):
+    """
+    Returns the time-stamped and Ed25519-signed list of revoked license IDs 
+    for offline client synchronization.
+    """
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_rate_limit(client_ip, limit=10, period=60)
+    
+    revoked_licenses = session.exec(select(License).where(License.is_revoked == True)).all()
+    revoked_ids = [lic.id for lic in revoked_licenses]
+    
+    timestamp_str = datetime.utcnow().isoformat()
+    
+    # Construct CRL payload
+    crl_payload = {
+        "revoked_ids": revoked_ids,
+        "timestamp": timestamp_str
+    }
+    
+    crl_json = json.dumps(crl_payload, sort_keys=True)
+    signature = kms_provider.sign(crl_json.encode("utf-8"))
+    signature_hex = signature.hex()
+    
+    log_audit_event(session, "CRL_EXPORTED", None, None, request, f"Exported signed revocation list containing {len(revoked_ids)} keys.")
+    
+    return {
+        "payload": crl_payload,
+        "signature": signature_hex
     }
