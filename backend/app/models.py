@@ -34,3 +34,12 @@ class Activation(SQLModel, table=True):
     activated_at: datetime = Field(default_factory=datetime.utcnow)
     
     license: License = Relationship(back_populates="activations")
+
+class AuditLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    event: str
+    license_id: Optional[str] = Field(default=None, nullable=True)
+    fingerprint_hash: Optional[str] = Field(default=None, nullable=True)
+    ip_address: str
+    details: str

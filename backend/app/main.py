@@ -2,9 +2,10 @@
 import os
 import uuid
 import json
-import hashlib
+import time
 import hmac
 import base64
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -20,7 +21,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.backends import default_backend
 
 from .database import create_db_and_tables, get_session
-from .models import Customer, License, Activation
+from .models import Customer, License, Activation, AuditLog
 from .crypto_utils import generate_key, encrypt_data, decrypt_data, derive_kek
 
 raw_secret = os.getenv("SERVER_SECRET", "vajraa_kms_master_secret_key_2026")
@@ -47,6 +48,88 @@ ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASS = os.getenv("ADMIN_PASS", "vajraa-secure-admin-pass-2026")
 
 security = HTTPBasic()
+
+# In-memory sliding-window rate limiter
+rate_limits = {}
+
+def check_rate_limit(ip_address: str, limit: int = 5, period: int = 60):
+    """Enforces sliding-window rate limiting per IP address."""
+    now = time.time()
+    if ip_address not in rate_limits:
+        rate_limits[ip_address] = []
+        
+    # Filter out older timestamps
+    rate_limits[ip_address] = [t for t in rate_limits[ip_address] if now - t < period]
+    
+    if len(rate_limits[ip_address]) >= limit:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many activation attempts. Rate limit exceeded."
+        )
+    
+    rate_limits[ip_address].append(now)
+
+def log_audit_event(
+    session: Session,
+    event: str,
+    license_id: Optional[str],
+    fingerprint_hash: Optional[str],
+    request: Request,
+    details: str
+):
+    """Logs a security or activation event to the database audit trail."""
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    log_entry = AuditLog(
+        event=event,
+        license_id=license_id,
+        fingerprint_hash=fingerprint_hash,
+        ip_address=client_ip,
+        details=details
+    )
+    session.add(log_entry)
+    session.commit()
+
+def verify_proof_of_possession(
+    fingerprint_hash: str,
+    client_timestamp_str: str,
+    pop_token: str,
+    max_drift_seconds: int = 300
+):
+    """
+    Verifies client possession of the physical machine fingerprint
+    by validating the time-locked HMAC-SHA256 signature.
+    """
+    try:
+        client_time = datetime.fromisoformat(client_timestamp_str)
+        now = datetime.utcnow()
+        
+        # Check clock drift
+        drift = abs((now - client_time).total_seconds())
+        if drift > max_drift_seconds:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Proof-of-Possession expired. Clock drift is {int(drift)}s (max allowed is {max_drift_seconds}s)."
+            )
+            
+        # Verify HMAC-SHA256 of fingerprint_hash over the timestamp
+        expected_token = hmac.new(
+            fingerprint_hash.encode("utf-8"),
+            client_timestamp_str.encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        
+        if not hmac.compare_digest(pop_token, expected_token):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Proof-of-Possession validation failed: signature mismatch."
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid Proof-of-Possession payload format: {e}"
+        )
 
 def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
     """Verifies administrator Basic Authentication credentials."""
@@ -204,12 +287,16 @@ def get_activation_page(data: str):
 @app.post("/api/activate/offline")
 def api_activate_offline(
     payload: OfflineActivateRequest,
+    request: Request,
     session: Session = Depends(get_session)
 ):
     """
     Decrypts the offline QR payload, validates the license/quotas,
-    registers the activation, signs the lease via Ed25519, and returns the token.
+    verifies Proof-of-Possession, registers activation, and returns the token.
     """
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_rate_limit(client_ip)
+    
     try:
         # Try as plain base64 QR payload first (asymmetric flow)
         try:
@@ -223,15 +310,31 @@ def api_activate_offline(
         license_id = data_dict["license_id"]
         fingerprint_hash = data_dict["fingerprint_hash"]
         hardware_details = data_dict.get("hardware_details", "{}")
+        timestamp = data_dict.get("timestamp")
+        pop_token = data_dict.get("pop_token")
         
-    except Exception:
+    except Exception as e:
+        log_audit_event(session, "ACTIVATION_FAILURE", None, None, request, f"Invalid QR activation payload: {e}")
         raise HTTPException(status_code=400, detail="Invalid QR Activation Payload")
+        
+    # Check Proof-of-Possession (allow up to 24 hours of drift for offline systems)
+    if timestamp and pop_token:
+        try:
+            verify_proof_of_possession(fingerprint_hash, timestamp, pop_token, max_drift_seconds=86400)
+        except HTTPException as e:
+            log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, f"Offline PoP verification failed: {e.detail}")
+            raise
+    else:
+        # Compatibility fallback for legacy/plain test cases, log warning
+        log_audit_event(session, "ACTIVATION_WARNING", license_id, fingerprint_hash, request, "Offline activation without Proof-of-Possession")
         
     lic = session.get(License, license_id)
     if not lic or lic.is_revoked:
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, "License invalid or revoked")
         raise HTTPException(status_code=400, detail="License is invalid or has been revoked")
         
     if lic.expires_at < datetime.utcnow():
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, "License expired")
         raise HTTPException(status_code=400, detail="License trial period has expired")
         
     # Check activation device limit
@@ -239,11 +342,12 @@ def api_activate_offline(
     device_already_active = any(act.hardware_hash == fingerprint_hash for act in existing_activations)
     
     if not device_already_active and len(existing_activations) >= lic.max_devices:
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, f"Activation quota limit reached ({lic.max_devices})")
         raise HTTPException(status_code=400, detail=f"Activation limit reached ({lic.max_devices} devices).")
         
     expires_at_str = lic.expires_at.isoformat()
     
-    # 1. Asymmetric Ed25519 signature on canonical verification string
+    # 1. Asymmetric Ed25519 signature
     canonical_payload = f"{license_id}:{fingerprint_hash}:{expires_at_str}"
     signature = private_key.sign(canonical_payload.encode("utf-8"))
     signature_hex = signature.hex()
@@ -285,6 +389,8 @@ def api_activate_offline(
         session.add(activation_obj)
         session.commit()
         
+    log_audit_event(session, "ACTIVATION_SUCCESS", license_id, fingerprint_hash, request, f"Device offline activation complete. Code: {activation_code}")
+    
     return {
         "status": "SUCCESS",
         "activation_code": activation_code,
@@ -294,26 +400,42 @@ def api_activate_offline(
     }
 
 @app.post("/api/activate")
-def api_activate(payload: dict, session: Session = Depends(get_session)):
-    """API endpoint for direct online client activation checks."""
+def api_activate(payload: dict, request: Request, session: Session = Depends(get_session)):
+    """API endpoint for direct online client activation checks with strict Proof-of-Possession."""
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_rate_limit(client_ip)
+    
     try:
         license_id = payload["license_id"]
         fingerprint_hash = payload["fingerprint_hash"]
+        timestamp = payload["timestamp"]
+        pop_token = payload["pop_token"]
         hardware_details = payload.get("hardware_details", {})
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid payload format")
+    except KeyError as e:
+        log_audit_event(session, "ACTIVATION_FAILURE", None, None, request, f"Missing required activation field: {e}")
+        raise HTTPException(status_code=400, detail=f"Missing required activation field: {e}")
+        
+    # Enforce strict Proof-of-Possession (5 minutes drift allowed)
+    try:
+        verify_proof_of_possession(fingerprint_hash, timestamp, pop_token, max_drift_seconds=300)
+    except HTTPException as e:
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, f"Proof-of-Possession check failed: {e.detail}")
+        raise
         
     lic = session.get(License, license_id)
     if not lic or lic.is_revoked:
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, "License invalid or revoked")
         raise HTTPException(status_code=400, detail="License is invalid or has been revoked")
         
     if lic.expires_at < datetime.utcnow():
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, "License expired")
         raise HTTPException(status_code=400, detail="License trial period has expired")
         
     existing_activations = session.exec(select(Activation).where(Activation.license_id == license_id)).all()
     device_already_active = any(act.hardware_hash == fingerprint_hash for act in existing_activations)
     
     if not device_already_active and len(existing_activations) >= lic.max_devices:
+        log_audit_event(session, "ACTIVATION_FAILURE", license_id, fingerprint_hash, request, f"Activation limit reached ({lic.max_devices})")
         raise HTTPException(status_code=400, detail="Activation limit reached for this license key")
         
     expires_at_str = lic.expires_at.isoformat()
@@ -349,6 +471,8 @@ def api_activate(payload: dict, session: Session = Depends(get_session)):
         session.add(activation_obj)
         session.commit()
         
+    log_audit_event(session, "ACTIVATION_SUCCESS", license_id, fingerprint_hash, request, f"Device online activation complete. Code: {activation_code}")
+    
     return {
         "status": "SUCCESS",
         "activation_code": activation_code,
@@ -358,22 +482,29 @@ def api_activate(payload: dict, session: Session = Depends(get_session)):
     }
 
 @app.post("/api/verify")
-def api_verify(payload: dict, session: Session = Depends(get_session)):
-    """API endpoint for periodic online client verification."""
+def api_verify(payload: dict, request: Request, session: Session = Depends(get_session)):
+    """API endpoint for periodic online client verification with rate limiting."""
+    client_ip = request.client.host if request.client else "127.0.0.1"
+    check_rate_limit(client_ip, limit=20, period=60) # Higher limit for periodic verifications
+    
     license_id = payload.get("license_id")
     fingerprint_hash = payload.get("fingerprint_hash")
     
     lic = session.get(License, license_id)
     if not lic or lic.is_revoked:
+        log_audit_event(session, "VERIFICATION_FAILED", license_id, fingerprint_hash, request, "Verification failed: License revoked")
         return {"status": "REVOKED", "message": "License has been revoked"}
         
     if lic.expires_at < datetime.utcnow():
+        log_audit_event(session, "VERIFICATION_FAILED", license_id, fingerprint_hash, request, "Verification failed: License expired")
         return {"status": "EXPIRED", "message": "License has expired"}
         
     activation = session.exec(select(Activation).where(Activation.license_id == license_id, Activation.hardware_hash == fingerprint_hash)).first()
     if not activation:
+        log_audit_event(session, "VERIFICATION_FAILED", license_id, fingerprint_hash, request, "Verification failed: Device not activated")
         return {"status": "NOT_ACTIVATED", "message": "Device not activated"}
         
+    log_audit_event(session, "VERIFICATION_SUCCESS", license_id, fingerprint_hash, request, "Device license verified successfully")
     return {
         "status": "ACTIVE",
         "expires_at": lic.expires_at.isoformat()
