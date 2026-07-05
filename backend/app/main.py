@@ -3,6 +3,8 @@ import os
 import uuid
 import json
 import hashlib
+import hmac
+import base64
 from datetime import datetime, timedelta
 from typing import Optional, List
 from fastapi import FastAPI, Depends, HTTPException, status, Request
@@ -12,12 +14,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, select
 from pydantic import BaseModel
 
+from cryptography.hazmat.primitives.asymmetric import ed25519
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.backends import default_backend
+
 from .database import create_db_and_tables, get_session
 from .models import Customer, License, Activation
-from .crypto_utils import generate_key, encrypt_data, decrypt_data, derive_kek, generate_activation_code
+from .crypto_utils import generate_key, encrypt_data, decrypt_data, derive_kek
 
 raw_secret = os.getenv("SERVER_SECRET", "vajraa_kms_master_secret_key_2026")
 SERVER_SECRET = hashlib.sha256(raw_secret.encode("utf-8")).digest()
+
+# Asymmetric Ed25519 keys derived deterministically from SERVER_SECRET
+private_key = ed25519.Ed25519PrivateKey.from_private_bytes(SERVER_SECRET)
+public_key = private_key.public_key()
+PUBLIC_KEY_HEX = public_key.public_bytes_raw().hex()
 
 app = FastAPI(title="Vajraa Licensing Server")
 
@@ -49,6 +61,11 @@ def authenticate_admin(credentials: HTTPBasicCredentials = Depends(security)):
 @app.on_event("startup")
 def on_startup():
     create_db_and_tables()
+    print(f"\n=====================================================================")
+    print(f"VAJRAA KMS SERVER STARTED (Asymmetric Signing Mode)")
+    print(f"Ed25519 Verification Key to embed in Client SDK:")
+    print(f"👉 PUBLIC_KEY_HEX = \"{PUBLIC_KEY_HEX}\"")
+    print(f"=====================================================================\n")
 
 # =====================================================================
 # REQUEST SCHEMAS
@@ -68,6 +85,21 @@ class LicenseCreate(BaseModel):
 
 class OfflineActivateRequest(BaseModel):
     data: str
+
+# =====================================================================
+# CRYPTO HELPERS
+# =====================================================================
+
+def derive_kek_asymmetric(signature: bytes, fingerprint_hash: str) -> bytes:
+    """Derives a 256-bit KEK from the Ed25519 signature & hardware fingerprint."""
+    hkdf = HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=fingerprint_hash.encode("utf-8"),
+        info=b"vajraa_asymmetric_kek_derivation",
+        backend=default_backend()
+    )
+    return hkdf.derive(signature)
 
 # =====================================================================
 # REST API ENDPOINTS
@@ -128,13 +160,8 @@ def create_license(
     license_id = f"LIC-{uuid.uuid4().hex[:8].upper()}"
     dek = generate_key()
     
-    # Envelope Encryption KEK derivation
-    if payload.target_fingerprint:
-        kek = derive_kek(payload.target_fingerprint, SERVER_SECRET)
-        wrapped_dek_dict = encrypt_data(dek, kek)
-    else:
-        # Wrap temporarily with server key
-        wrapped_dek_dict = encrypt_data(dek, SERVER_SECRET)
+    # Wrap temporarily with server secret key for database storage
+    wrapped_dek_dict = encrypt_data(dek, SERVER_SECRET)
         
     license_obj = License(
         id=license_id,
@@ -181,12 +208,17 @@ def api_activate_offline(
 ):
     """
     Decrypts the offline QR payload, validates the license/quotas,
-    registers the activation, and returns the 16-character code and KEK-wrapped DEK.
+    registers the activation, signs the lease via Ed25519, and returns the token.
     """
     try:
-        # Decrypt incoming QR payload using Server Secret
-        payload_bytes = decrypt_data(json.loads(payload.data), SERVER_SECRET)
-        data_dict = json.loads(payload_bytes.decode("utf-8"))
+        # Try as plain base64 QR payload first (asymmetric flow)
+        try:
+            payload_bytes = base64.b64decode(payload.data)
+            data_dict = json.loads(payload_bytes.decode("utf-8"))
+        except Exception:
+            # Fallback to symmetric decryption for backward compatibility
+            payload_bytes = decrypt_data(json.loads(payload.data), SERVER_SECRET)
+            data_dict = json.loads(payload_bytes.decode("utf-8"))
         
         license_id = data_dict["license_id"]
         fingerprint_hash = data_dict["fingerprint_hash"]
@@ -209,23 +241,37 @@ def api_activate_offline(
     if not device_already_active and len(existing_activations) >= lic.max_devices:
         raise HTTPException(status_code=400, detail=f"Activation limit reached ({lic.max_devices} devices).")
         
-    # Generate 16-character HMAC code
-    activation_code = generate_activation_code(fingerprint_hash, license_id, SERVER_SECRET)
+    expires_at_str = lic.expires_at.isoformat()
     
-    # Decrypt original DEK
+    # 1. Asymmetric Ed25519 signature on canonical verification string
+    canonical_payload = f"{license_id}:{fingerprint_hash}:{expires_at_str}"
+    signature = private_key.sign(canonical_payload.encode("utf-8"))
+    signature_hex = signature.hex()
+    
+    # 2. Derive KEK using the signature and fingerprint hash via HKDF
+    kek = derive_kek_asymmetric(signature, fingerprint_hash)
+    
+    # 3. Decrypt original DEK
     stored_dek_dict = json.loads(lic.encrypted_dek)
     dek = decrypt_data(stored_dek_dict, SERVER_SECRET)
     
-    # Wrap DEK with client KEK derived from fingerprint
-    kek = derive_kek(fingerprint_hash, SERVER_SECRET)
+    # 4. Wrap DEK with our derived asymmetric KEK
     wrapped_dek_dict = encrypt_data(dek, kek)
     
-    # Combine activation code and wrapped DEK into a single Base64 activation token string
+    # 5. Pack complete token (Base64 JSON containing payload, signature, and wrapped DEK)
     token_payload = {
-        "code": activation_code,
+        "license_id": license_id,
+        "fingerprint_hash": fingerprint_hash,
+        "expires_at": expires_at_str,
+        "signature": signature_hex,
         "wrapped_dek": wrapped_dek_dict
     }
-    activation_token = json.dumps(token_payload)
+    activation_token = base64.b64encode(json.dumps(token_payload).encode("utf-8")).decode("utf-8")
+    
+    # Short 16-character human-friendly code derived via HMAC of the signature
+    h = hmac.new(SERVER_SECRET, signature, hashlib.sha256).digest()
+    b32 = base64.b32encode(h).decode("utf-8").replace("=", "")
+    activation_code = f"{b32[0:4]}-{b32[4:8]}-{b32[8:12]}-{b32[12:16]}"
     
     # Register device activation if not already present
     if not device_already_active:
@@ -270,13 +316,27 @@ def api_activate(payload: dict, session: Session = Depends(get_session)):
     if not device_already_active and len(existing_activations) >= lic.max_devices:
         raise HTTPException(status_code=400, detail="Activation limit reached for this license key")
         
-    activation_code = generate_activation_code(fingerprint_hash, license_id, SERVER_SECRET)
+    expires_at_str = lic.expires_at.isoformat()
     
+    # 1. Asymmetric Ed25519 signature
+    canonical_payload = f"{license_id}:{fingerprint_hash}:{expires_at_str}"
+    signature = private_key.sign(canonical_payload.encode("utf-8"))
+    signature_hex = signature.hex()
+    
+    # 2. Derive KEK
+    kek = derive_kek_asymmetric(signature, fingerprint_hash)
+    
+    # 3. Decrypt/Unwrap DEK
     stored_dek_dict = json.loads(lic.encrypted_dek)
     dek = decrypt_data(stored_dek_dict, SERVER_SECRET)
     
-    kek = derive_kek(fingerprint_hash, SERVER_SECRET)
+    # 4. Wrap DEK
     wrapped_dek_dict = encrypt_data(dek, kek)
+    
+    # 5. Short code
+    h = hmac.new(SERVER_SECRET, signature, hashlib.sha256).digest()
+    b32 = base64.b32encode(h).decode("utf-8").replace("=", "")
+    activation_code = f"{b32[0:4]}-{b32[4:8]}-{b32[8:12]}-{b32[12:16]}"
     
     if not device_already_active:
         activation_obj = Activation(
@@ -292,8 +352,9 @@ def api_activate(payload: dict, session: Session = Depends(get_session)):
     return {
         "status": "SUCCESS",
         "activation_code": activation_code,
+        "signature": signature_hex,
         "wrapped_dek": wrapped_dek_dict,
-        "expires_at": lic.expires_at.isoformat()
+        "expires_at": expires_at_str
     }
 
 @app.post("/api/verify")
